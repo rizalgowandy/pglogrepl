@@ -280,6 +280,28 @@ type StartReplicationOptions struct {
 	PluginArgs []string
 }
 
+type errEndTimeline struct {
+	nextTli         int64
+	nextTliStartpos LSN
+}
+
+func (e errEndTimeline) Error() string {
+	return "start replication with a switch point"
+}
+
+func (e errEndTimeline) ErrEndTimeline() (int64, LSN) {
+	return e.nextTli, e.nextTliStartpos
+}
+
+func IsErrEndTimeline(err error) (int64, LSN, bool) {
+	e, ok := err.(interface{ ErrEndTimeline() (int64, LSN) })
+	if !ok {
+		return 0, 0, false
+	}
+	nextTli, nextTliStartpos := e.ErrEndTimeline()
+	return nextTli, nextTliStartpos, true
+}
+
 // StartReplication begins the replication process by executing the START_REPLICATION command.
 func StartReplication(ctx context.Context, conn *pgconn.PgConn, slotName string, startLSN LSN, options StartReplicationOptions) error {
 	var timelineString string
@@ -303,6 +325,10 @@ func StartReplication(ctx context.Context, conn *pgconn.PgConn, slotName string,
 		return fmt.Errorf("failed to send START_REPLICATION: %w", err)
 	}
 
+	var (
+		nextTli         int64
+		nextTliStartpos LSN
+	)
 	for {
 		msg, err := conn.ReceiveMessage(ctx)
 		if err != nil {
@@ -316,6 +342,32 @@ func StartReplication(ctx context.Context, conn *pgconn.PgConn, slotName string,
 		case *pgproto3.CopyBothResponse:
 			// This signals the start of the replication stream.
 			return nil
+		case *pgproto3.RowDescription:
+			if options.Mode != PhysicalReplication {
+				return fmt.Errorf("received row RowDescription message in logical replication")
+			}
+			if len(msg.Fields) != 2 || string(msg.Fields[0].Name) != "next_tli" || string(msg.Fields[1].Name) != "next_tli_startpos" {
+				return fmt.Errorf("expected next timeline row description message")
+			}
+		case *pgproto3.DataRow:
+			if cnt := len(msg.Values); cnt != 2 {
+				return fmt.Errorf("expected next_tli and next_tli_startpos, got %d fields", cnt)
+			}
+			tmpNextTli, tmpNextTliStartpos := string(msg.Values[0]), string(msg.Values[1])
+			nextTli, err = strconv.ParseInt(tmpNextTli, 10, 64)
+			if err != nil {
+				return err
+			}
+			nextTliStartpos, err = ParseLSN(tmpNextTliStartpos)
+			if err != nil {
+				return err
+			}
+		case *pgproto3.CommandComplete:
+		case *pgproto3.ReadyForQuery:
+			// if no next timeline switch result, maybe it was left on the connection
+			if nextTli > 0 && nextTliStartpos > 0 {
+				return errEndTimeline{nextTli: nextTli, nextTliStartpos: nextTliStartpos}
+			}
 		default:
 			return fmt.Errorf("unexpected response type: %T", msg)
 		}
@@ -569,12 +621,39 @@ func FinishBaseBackup(ctx context.Context, conn *pgconn.PgConn) (result BaseBack
 	if err != nil {
 		return result, err
 	}
-	result.Tablespaces, err = getTableSpaceInfo(ctx, conn)
+
+	// Base_Backup done, server send a command complete response from pg13
+	vmaj, err := serverMajorVersion(conn)
 	if err != nil {
-		return result, err
+		return
 	}
-	_, err = SendStandbyCopyDone(context.Background(), conn)
-	return result, err
+	var (
+		pack pgproto3.BackendMessage
+		ok   bool
+	)
+	if vmaj > 12 {
+		pack, err = conn.ReceiveMessage(ctx)
+		if err != nil {
+			return
+		}
+		_, ok = pack.(*pgproto3.CommandComplete)
+		if !ok {
+			err = fmt.Errorf("expect command_complete, got %T", pack)
+			return
+		}
+	}
+
+	// simple query done, server send a ready for query response
+	pack, err = conn.ReceiveMessage(ctx)
+	if err != nil {
+		return
+	}
+	_, ok = pack.(*pgproto3.ReadyForQuery)
+	if !ok {
+		err = fmt.Errorf("expect ready_for_query, got %T", pack)
+		return
+	}
+	return
 }
 
 type PrimaryKeepaliveMessage struct {
@@ -657,7 +736,10 @@ func SendStandbyStatusUpdate(_ context.Context, conn *pgconn.PgConn, ssu Standby
 	}
 
 	cd := &pgproto3.CopyData{Data: data}
-	buf := cd.Encode(nil)
+	buf, err := cd.Encode(nil)
+	if err != nil {
+		return err
+	}
 
 	return conn.Frontend().SendUnbufferedEncodedCopyData(buf)
 }
